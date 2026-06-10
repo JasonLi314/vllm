@@ -345,6 +345,53 @@ def test_per_token_group_quant_fp8_packed_zero_fills_padded_output_q(
         )
 
 
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(),
+    reason="DeepGEMM not available on this platform",
+)
+def test_per_token_group_quant_fp8_packed_large_mn():
+    """Regression test for https://github.com/vllm-project/vllm/issues/45099.
+
+    The packed kernel used to map rows to grid.y, which CUDA caps at 65535.
+    Quantizing tensors with more rows than that (e.g. DeepSeek V4 MTP
+    quantizes (num_tokens, hc_mult, hidden) activations, mn = 32768 * 4 at
+    profile_run) failed at launch with `CUDA error: invalid argument`.
+    """
+
+    device = "cuda"
+    group_size = 128
+    # hidden 2048 -> 16 groups per row -> kx=16, ry=1: one grid row per mn
+    # row, so any mn > 65535 overflowed grid.y before the fix.
+    num_tokens, hidden_dim = 65537, 2048
+    torch.manual_seed(42)
+    x = torch.randn((num_tokens, hidden_dim), device=device, dtype=torch.bfloat16) * 8
+
+    out_q, out_s_packed = fp8_utils.per_token_group_quant_fp8_packed_for_deepgemm(
+        x,
+        group_size=group_size,
+        use_ue8m0=True,
+    )
+
+    with patch("vllm.platforms.current_platform.is_cuda_alike", return_value=False):
+        ref_q, ref_s = fp8_utils.per_token_group_quant_fp8(x, group_size, use_ue8m0=True)
+
+    assert torch.equal(out_q, ref_q), "Quantized output mismatch"
+
+    # Vectorized packed-scale check; the per-element loop used by the smaller
+    # tests is too slow at this size. groups_per_row is a multiple of 4 here,
+    # so there is no K padding and the packed view lines up exactly.
+    mn = num_tokens
+    groups_per_row = hidden_dim // group_size
+    k_num_packed = (groups_per_row + 3) // 4
+    assert groups_per_row % 4 == 0
+    ref_exponents = (ref_s.reshape(mn, groups_per_row).view(torch.int32) >> 23) & 0xFF
+    exp = ref_exponents.view(mn, k_num_packed, 4)
+    expected = (
+        exp[..., 0] | (exp[..., 1] << 8) | (exp[..., 2] << 16) | (exp[..., 3] << 24)
+    )
+    assert torch.equal(out_s_packed.cpu(), expected.cpu()), "Packed scale mismatch"
+
+
 @pytest.mark.parametrize("shape", [(32, 128), (64, 256), (16, 512)])
 @pytest.mark.parametrize("group_size", [64, 128])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
